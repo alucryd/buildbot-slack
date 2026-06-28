@@ -1,16 +1,13 @@
 # Based on the gitlab reporter from buildbot
 
-from __future__ import absolute_import, print_function
-
 from twisted.internet import defer
+from twisted.python import log
 
-from buildbot.process.properties import Properties
 from buildbot.process.results import statusToString
-from buildbot.reporters import http, utils
+from buildbot.reporters.base import ReporterBase
+from buildbot.reporters.generators.build import BuildStatusGenerator
+from buildbot.reporters.message import MessageFormatterBase
 from buildbot.util import httpclientservice
-from buildbot.util.logger import Logger
-
-logger = Logger()
 
 STATUS_EMOJIS = {
     "success": ":sunglassses:",
@@ -33,77 +30,60 @@ STATUS_COLORS = {
 DEFAULT_HOST = "https://hooks.slack.com"  # deprecated
 
 
-class SlackStatusPush(http.HttpStatusPushBase):
-    name = "SlackStatusPush"
-    neededDetails = dict(wantProperties=True)
+class SlackMessageFormatter(MessageFormatterBase):
+    """Builds the Slack webhook payload for a single build.
 
-    def checkConfig(
-        self, endpoint, channel=None, host_url=None, username=None, **kwargs
-    ):
-        if not isinstance(endpoint, str):
-            logger.warning(
-                "[SlackStatusPush] endpoint should be a string, got '%s' instead",
-                type(endpoint).__name__,
-            )
-        elif not endpoint.startswith("http"):
-            logger.warning(
-                '[SlackStatusPush] endpoint should start with "http...", endpoint: %s',
-                endpoint,
-            )
-        if channel and not isinstance(channel, str):
-            logger.warning(
-                "[SlackStatusPush] channel must be a string, got '%s' instead",
-                type(channel).__name__,
-            )
-        if username and not isinstance(username, str):
-            logger.warning(
-                "[SlackStatusPush] username must be a string, got '%s' instead",
-                type(username).__name__,
-            )
-        if host_url and not isinstance(host_url, str):  # deprecated
-            logger.warning(
-                "[SlackStatusPush] host_url must be a string, got '%s' instead",
-                type(host_url).__name__,
-            )
-        elif host_url:
-            logger.warning(
-                "[SlackStatusPush] argument host_url is deprecated and will be removed in the next release: specify the full url as endpoint"
-            )
+    The returned ``body`` is a JSON-serializable dict that is posted verbatim
+    to the Slack incoming webhook by :class:`SlackStatusPush`.
+    """
 
-    @defer.inlineCallbacks
-    def reconfigService(
-        self,
-        endpoint,
-        channel=None,
-        host_url=None,  # deprecated
-        username=None,
-        attachments=True,
-        verbose=False,
-        **kwargs
-    ):
+    template_type = "json"
 
-        yield super().reconfigService(**kwargs)
-
-        self.baseUrl = host_url and host_url.rstrip("/")  # deprecated
-        if host_url:
-            logger.warning(
-                "[SlackStatusPush] argument host_url is deprecated and will be removed in the next release: specify the full url as endpoint"
-            )
-        self.endpoint = endpoint
+    def __init__(self, channel=None, username=None, attachments=True, verbose=False):
+        super().__init__(want_properties=True)
         self.channel = channel
         self.username = username
         self.attachments = attachments
-        self._http = yield httpclientservice.HTTPClientService.getService(
-            self.master,
-            self.baseUrl or self.endpoint,
-            debug=self.debug,
-            verify=self.verify,
-        )
         self.verbose = verbose
-        self.project_ids = {}
 
-    @defer.inlineCallbacks
-    def getAttachments(self, build, key):
+    def format_message_for_build(
+        self, master, build, is_buildset=False, users=None, mode=None
+    ):
+        post_data = {"text": self._get_message(build)}
+
+        if self.attachments:
+            attachments = self._get_attachments(build)
+            if attachments:
+                post_data["attachments"] = attachments
+        else:
+            post_data["text"] += " here: " + build.get("url", "")
+
+        if self.channel:
+            post_data["channel"] = self.channel
+
+        if self.username:
+            post_data["username"] = self.username
+
+        post_data["icon_emoji"] = STATUS_EMOJIS.get(
+            statusToString(build["results"]), ":facepalm:"
+        )
+
+        return {
+            "body": post_data,
+            "type": self.template_type,
+            "subject": None,
+            "extra_info": None,
+        }
+
+    def _get_message(self, build):
+        if not build["complete"]:
+            return "Buildbot started build %s" % build["builder"]["name"]
+        return "Buildbot finished build %s with result: %s" % (
+            build["builder"]["name"],
+            statusToString(build["results"]),
+        )
+
+    def _get_attachments(self, build):
         sourcestamps = build["buildset"]["sourcestamps"]
         attachments = []
 
@@ -133,17 +113,7 @@ class SlackStatusPush(http.HttpStatusPushBase):
                     fields.append(
                         {"title": "Repository", "value": repositories, "short": True}
                     )
-                responsible_users = yield utils.getResponsibleUsersForBuild(
-                    self.master, build["buildid"]
-                )
-                if responsible_users:
-                    fields.append(
-                        {
-                            "title": "Committers",
-                            "value": ", ".join(responsible_users),
-                            "short": True,
-                        }
-                    )
+
             attachments.append(
                 {
                     "title": title,
@@ -159,79 +129,111 @@ class SlackStatusPush(http.HttpStatusPushBase):
             )
         return attachments
 
+
+class SlackStatusPush(ReporterBase):
+    """Buildbot reporter that sends build status updates to Slack."""
+
+    name = "SlackStatusPush"
+
+    def checkConfig(
+        self,
+        endpoint,
+        channel=None,
+        host_url=None,  # deprecated
+        username=None,
+        attachments=True,
+        verbose=False,
+        debug=None,
+        verify=None,
+        generators=None,
+        **kwargs,
+    ):
+        if not isinstance(endpoint, str):
+            log.err(
+                "[SlackStatusPush] endpoint should be a string, got '%s' instead"
+                % type(endpoint).__name__
+            )
+        elif not endpoint.startswith("http"):
+            log.err(
+                '[SlackStatusPush] endpoint should start with "http...", endpoint: %s'
+                % endpoint
+            )
+        if channel and not isinstance(channel, str):
+            log.err(
+                "[SlackStatusPush] channel must be a string, got '%s' instead"
+                % type(channel).__name__
+            )
+        if username and not isinstance(username, str):
+            log.err(
+                "[SlackStatusPush] username must be a string, got '%s' instead"
+                % type(username).__name__
+            )
+        if host_url:
+            log.msg(
+                "[SlackStatusPush] argument host_url is deprecated and will be "
+                "removed in the next release: specify the full url as endpoint"
+            )
+
+        if generators is None:
+            generators = self._create_generators(
+                channel, username, attachments, verbose
+            )
+
+        super().checkConfig(generators=generators, **kwargs)
+
     @defer.inlineCallbacks
-    def getBuildDetailsAndSendMessage(self, build, key):
-        yield utils.getDetailsForBuild(self.master, build, **self.neededDetails)
-        text = yield self.getMessage(build, key)
-        postData = {}
-        if self.attachments:
-            attachments = yield self.getAttachments(build, key)
-            if attachments:
-                postData["attachments"] = attachments
-        else:
-            text += " here: " + build["url"]
-        postData["text"] = text
+    def reconfigService(
+        self,
+        endpoint,
+        channel=None,
+        host_url=None,  # deprecated
+        username=None,
+        attachments=True,
+        verbose=False,
+        debug=None,
+        verify=None,
+        generators=None,
+        **kwargs,
+    ):
+        self.debug = debug
+        self.verify = verify
 
-        if self.channel:
-            postData["channel"] = self.channel
+        if generators is None:
+            generators = self._create_generators(
+                channel, username, attachments, verbose
+            )
 
-        postData["icon_emoji"] = STATUS_EMOJIS.get(
-            statusToString(build["results"]), ":facepalm:"
+        yield super().reconfigService(generators=generators, **kwargs)
+
+        self._http = yield httpclientservice.HTTPSession(
+            self.master.httpservice,
+            host_url or endpoint,
+            debug=self.debug,
+            verify=self.verify,
         )
-        extra_params = yield self.getExtraParams(build, key)
-        postData.update(extra_params)
-        return postData
 
-    def getMessage(self, build, event_name):
-        event_messages = {
-            "new": "Buildbot started build %s" % build["builder"]["name"],
-            "finished": "Buildbot finished build %s with result: %s"
-            % (build["builder"]["name"], statusToString(build["results"])),
-        }
-        return event_messages.get(event_name, "")
+    def _create_generators(self, channel, username, attachments, verbose):
+        formatter = SlackMessageFormatter(
+            channel=channel,
+            username=username,
+            attachments=attachments,
+            verbose=verbose,
+        )
+        return [
+            BuildStatusGenerator(
+                mode="all", message_formatter=formatter, report_new=True
+            )
+        ]
 
-    # returns a Deferred that returns None
-    def buildStarted(self, key, build):
-        return self.send(build, key[2])
-
-    # returns a Deferred that returns None
-    def buildFinished(self, key, build):
-        return self.send(build, key[2])
-
-    def getExtraParams(self, build, event_name):
-        return {}
+    def is_status_2xx(self, code):
+        return code // 100 == 2
 
     @defer.inlineCallbacks
-    def send(self, build, key):
-        postData = yield self.getBuildDetailsAndSendMessage(build, key)
-        if not postData:
-            return
-
-        sourcestamps = build["buildset"]["sourcestamps"]
-
-        for sourcestamp in sourcestamps:
-            sha = sourcestamp["revision"]
-            if sha is None:
-                logger.info("no special revision for this")
-
-            logger.info("posting to {url}", url=self.endpoint)
-            try:
-                if self.baseUrl:
-                    # deprecated
-                    response = yield self._http.post(self.endpoint, json=postData)
-                else:
-                    response = yield self._http.post("", json=postData)
-                if response.code != 200:
-                    content = yield response.content()
-                    logger.error(
-                        "{code}: unable to upload status: {content}",
-                        code=response.code,
-                        content=content,
-                    )
-            except Exception as e:
-                logger.error(
-                    "Failed to send status for {repo} at {sha}: {error}",
-                    repo=sourcestamp["repository"],
-                    sha=sha,
-                    error=e,
-                )
+    def sendMessage(self, reports):
+        response = yield self._http.post("", json=reports[0]["body"])
+        if not self.is_status_2xx(response.code):
+            content = yield response.content()
+            log.err(
+                "[SlackStatusPush] %s: unable to upload status: %s"
+                % (response.code, content)
+            )
