@@ -3,6 +3,7 @@
 from twisted.internet import defer
 from twisted.python import log
 
+from buildbot.interfaces import IRenderable
 from buildbot.process.results import statusToString
 from buildbot.reporters.base import ReporterBase
 from buildbot.reporters.generators.build import BuildStatusGenerator
@@ -148,22 +149,25 @@ class SlackStatusPush(ReporterBase):
         generators=None,
         **kwargs,
     ):
-        if not isinstance(endpoint, str):
-            log.err(
-                "[SlackStatusPush] endpoint should be a string, got '%s' instead"
-                % type(endpoint).__name__
-            )
-        elif not endpoint.startswith("http"):
-            log.err(
-                '[SlackStatusPush] endpoint should start with "http...", endpoint: %s'
-                % endpoint
-            )
-        if channel and not isinstance(channel, str):
+        # endpoint/channel/username may be Buildbot renderables (e.g. a Secret),
+        # which are only resolved at reconfig time, so skip type checks for those.
+        if not IRenderable.providedBy(endpoint):
+            if not isinstance(endpoint, str):
+                log.err(
+                    "[SlackStatusPush] endpoint should be a string, got '%s' instead"
+                    % type(endpoint).__name__
+                )
+            elif not endpoint.startswith("http"):
+                log.err(
+                    '[SlackStatusPush] endpoint should start with "http...", endpoint: %s'
+                    % endpoint
+                )
+        if channel and not IRenderable.providedBy(channel) and not isinstance(channel, str):
             log.err(
                 "[SlackStatusPush] channel must be a string, got '%s' instead"
                 % type(channel).__name__
             )
-        if username and not isinstance(username, str):
+        if username and not IRenderable.providedBy(username) and not isinstance(username, str):
             log.err(
                 "[SlackStatusPush] username must be a string, got '%s' instead"
                 % type(username).__name__
@@ -203,11 +207,15 @@ class SlackStatusPush(ReporterBase):
                 channel, username, attachments, verbose
             )
 
+        # endpoint (and the deprecated host_url) may be renderables, e.g. a
+        # Secret holding the webhook URL. Render before creating the session.
+        server_url = yield self.renderSecrets(host_url or endpoint)
+
         yield super().reconfigService(generators=generators, **kwargs)
 
         self._http = yield httpclientservice.HTTPSession(
             self.master.httpservice,
-            host_url or endpoint,
+            server_url,
             debug=self.debug,
             verify=self.verify,
         )
